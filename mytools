@@ -6,6 +6,7 @@ we are wrong. See SPEC.md and tests/README.md.
 """
 
 import sys
+from bisect import bisect_left
 from collections.abc import Iterator
 from typing import NamedTuple, TextIO
 
@@ -16,6 +17,8 @@ usage: mytools <subcommand> [options]
 
   sort  -i <file|->            sort by chrom, then start, then end
   merge -i <file|-> [-d N]     join features whose gap is <= N (default 0)
+  intersect -a <file|-> -b <file> [-u|-v|-wa]
+                               report where -a features meet -b features
   --version                    print the version and exit
 
 `-` means stdin.
@@ -269,7 +272,137 @@ def cmd_merge(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"sort": cmd_sort, "merge": cmd_merge}
+class Index:
+    """The -b file, in memory, grouped by chromosome and searchable by start.
+
+    -b intervals are stored widened: a zero-length feature is [x-1, x+1) here,
+    because that is what bedtools tests against and what it reports back.
+
+    Each interval keeps its line number in -b, because bedtools reports hits in
+    -b file order, not in coordinate order. Sorting the hits would look tidier
+    and would be wrong.
+    """
+
+    def __init__(self) -> None:
+        self.starts: dict[str, list[int]] = {}
+        self.ends: dict[str, list[int]] = {}
+        self.orders: dict[str, list[int]] = {}
+        self.max_ends: dict[str, list[int]] = {}
+
+    @classmethod
+    def load(cls, path: str) -> "Index":
+        index = cls()
+        by_chrom: dict[str, list[tuple[int, int, int]]] = {}
+        with open_input(path) as stream:
+            for order, record in enumerate(read_bed(stream, path)):
+                start, end = widen_if_empty(record.start, record.end)
+                if start < 0:
+                    # Oracle behaviour, and it is a crash: widening chr2 0 0 to
+                    # -1 makes bedtools die with "Received illegal bin number -1
+                    # from getBin call", exit 1, nothing on stdout. Reproduced
+                    # rather than fixed -- see `intersect b a` in the golden suite.
+                    raise BedError(
+                        f"{path}: {record.chrom} {record.start} {record.end} widens "
+                        f"to a negative coordinate, which bedtools cannot index"
+                    )
+                by_chrom.setdefault(record.chrom, []).append((start, end, order))
+
+        for chrom, intervals in by_chrom.items():
+            intervals.sort()
+            index.starts[chrom] = [s for s, _, _ in intervals]
+            index.ends[chrom] = [e for _, e, _ in intervals]
+            index.orders[chrom] = [o for _, _, o in intervals]
+            running = []
+            highest = 0
+            for _, end, _ in intervals:
+                highest = max(highest, end)
+                running.append(highest)
+            index.max_ends[chrom] = running
+        return index
+
+    def hits(self, chrom: str, start: int, end: int) -> list[tuple[int, int]]:
+        """Widened -b intervals overlapping [start, end), in -b file order."""
+        starts = self.starts.get(chrom)
+        if starts is None:
+            return []
+        ends, orders = self.ends[chrom], self.orders[chrom]
+        max_ends = self.max_ends[chrom]
+        found = []
+        # Everything at or past `end` is too far right; walk left from there and
+        # stop as soon as no earlier interval can reach back to `start`.
+        for i in range(bisect_left(starts, end) - 1, -1, -1):
+            if max_ends[i] <= start:
+                break
+            if ends[i] > start:
+                found.append((orders[i], starts[i], ends[i]))
+        found.sort()
+        return [(start, end) for _, start, end in found]
+
+
+def cmd_intersect(argv: list[str]) -> int:
+    """intersect -a <file|-> -b <file> [-u|-v|-wa]
+
+    -a streams and keeps its input order; -b is held in memory. The overlap
+    test widens zero-length features on both sides, but the region reported by
+    the default mode uses -a's original coordinates against -b's widened ones:
+    intersecting chr1 100 200 with chr1 150 150 prints chr1 149 151.
+    """
+    a_path = b_path = None
+    modes = []
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "-a":
+            a_path = take_value(args, "intersect: -a")
+        elif arg == "-b":
+            b_path = take_value(args, "intersect: -b")
+        elif arg in ("-u", "-v", "-wa"):
+            modes.append(arg)
+        else:
+            raise UsageError(f"intersect: unrecognized argument: {arg}")
+    if a_path is None or b_path is None:
+        raise UsageError("intersect: -a and -b are both required")
+    if len(modes) > 1:
+        raise UsageError(f"intersect: {' and '.join(modes)} are mutually exclusive")
+    if b_path == "-":
+        raise UsageError("intersect: -b must be a real file, not stdin")
+    mode = modes[0] if modes else None
+
+    index = Index.load(b_path)
+
+    stream = open_input(a_path)
+    try:
+        for record in read_bed(stream, a_path):
+            query_start, query_end = widen_if_empty(record.start, record.end)
+            hits = index.hits(record.chrom, query_start, query_end)
+
+            if mode == "-v":
+                if not hits:
+                    sys.stdout.write(record.line + "\n")
+                continue
+            if mode == "-u":
+                if hits:
+                    sys.stdout.write(record.line + "\n")
+                continue
+            if mode == "-wa":
+                for _ in hits:
+                    sys.stdout.write(record.line + "\n")
+                continue
+
+            # Default: the shared region, carrying -a's trailing columns.
+            trailing = record.line.split("\t")[3:]
+            for hit_start, hit_end in hits:
+                start = max(record.start, hit_start)
+                end = min(record.end, hit_end)
+                columns = [record.chrom, str(start), str(end), *trailing]
+                sys.stdout.write("\t".join(columns) + "\n")
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+    return 0
+
+
+COMMANDS = {"sort": cmd_sort, "merge": cmd_merge, "intersect": cmd_intersect}
 
 
 def main(argv: list[str]) -> int:
