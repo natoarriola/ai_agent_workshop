@@ -116,8 +116,14 @@ to its bedtools equivalent on the files in `data/`:
 
 Also required: `mytools --version` prints a version and exits 0.
 
-Accepted deviations from bedtools: none. If you find one you cannot fix, write it
-down here with the reason.
+Accepted deviations from bedtools:
+
+- **`merge` on a chromosome revisit.** Both exit 1, but we have already streamed the
+  clusters that completed before the error, where bedtools writes nothing at all.
+  Matching it would mean buffering the whole file, which is what §6 says `merge` must
+  not do. No golden case covers it; stdout on a failed run is not part of the contract.
+
+If you find another you cannot fix, write it down here with the reason.
 
 ## 9. Language and layout
 
