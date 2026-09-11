@@ -6,16 +6,122 @@ we are wrong. See SPEC.md and tests/README.md.
 """
 
 import sys
+from collections.abc import Iterator
+from typing import NamedTuple, TextIO
 
 VERSION = "0.1.0"
 
 USAGE = """\
 usage: mytools <subcommand> [options]
 
-  --version    print the version and exit
+  sort -i <file|->    sort by chrom, then start, then end
+  --version           print the version and exit
 
-No subcommands yet.
+`-` means stdin.
 """
+
+
+class BedError(Exception):
+    """Bad input data. Exit 1."""
+
+
+class UsageError(Exception):
+    """Bad invocation. Exit 2."""
+
+
+# Skipped silently, as bedtools does.
+SKIP_PREFIXES = ("#", "track", "browser")
+
+
+class Record(NamedTuple):
+    chrom: str
+    start: int
+    end: int
+    line: str  # the input line, verbatim, so every column survives untouched
+
+
+def open_input(path: str) -> TextIO:
+    if path == "-":
+        return sys.stdin
+    try:
+        return open(path, encoding="utf-8")
+    except OSError as exc:
+        raise UsageError(f"cannot read {path}: {exc.strerror}") from exc
+
+
+def read_bed(stream: TextIO, source: str) -> Iterator[Record]:
+    """Parse BED3-BED6 records, raising BedError on anything malformed.
+
+    The line is carried through verbatim rather than rebuilt from the parsed
+    fields, so every column we do not touch survives byte-identical.
+    """
+    n_fields = None
+    for lineno, raw in enumerate(stream, 1):
+        line = raw.rstrip("\n")
+        if not line.strip() or line.startswith(SKIP_PREFIXES):
+            continue
+
+        fields = line.split("\t")
+        if len(fields) < 3:
+            raise BedError(
+                f"{source}:{lineno}: fewer than 3 columns -- is it tab-delimited?"
+            )
+        if n_fields is None:
+            n_fields = len(fields)
+        elif len(fields) != n_fields:
+            # bedtools refuses ragged input rather than padding it, and it is the
+            # oracle: "Differing number of BED fields encountered at line: 2".
+            raise BedError(
+                f"{source}:{lineno}: differing number of BED fields "
+                f"({len(fields)}, expected {n_fields})"
+            )
+
+        try:
+            start, end = int(fields[1]), int(fields[2])
+        except ValueError:
+            raise BedError(f"{source}:{lineno}: non-integer start or end") from None
+        if start < 0 or end < 0:
+            raise BedError(f"{source}:{lineno}: negative coordinate")
+        if start > end:
+            raise BedError(f"{source}:{lineno}: start > end ({start} > {end})")
+
+        yield Record(fields[0], start, end, line)
+
+
+def cmd_sort(argv: list[str]) -> int:
+    """sort -i <file|->
+
+    Chromosomes order byte-wise, not naturally -- chr17 before chr7, and the
+    oracle agrees. Python's sort is stable, which is what keeps features with
+    identical coordinates in input order (a09 before a10 in the fixtures).
+    """
+    path = None
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "-i":
+            if not args:
+                raise UsageError("sort: -i requires a file")
+            path = args.pop(0)
+        else:
+            raise UsageError(f"sort: unrecognized argument: {arg}")
+    if path is None:
+        raise UsageError("sort: -i is required")
+
+    stream = open_input(path)
+    try:
+        # The one command allowed to hold its whole input in memory.
+        records = sorted(
+            read_bed(stream, path), key=lambda r: (r.chrom, r.start, r.end)
+        )
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+
+    for record in records:
+        sys.stdout.write(record.line)
+        sys.stdout.write("\n")
+    return 0
 
 
 def widen_if_empty(start: int, end: int) -> tuple[int, int]:
@@ -69,6 +175,20 @@ def main(argv: list[str]) -> int:
     if argv[0] in ("--help", "-h"):
         sys.stdout.write(USAGE)
         return 0
+
+    if argv[0] == "sort":
+        try:
+            return cmd_sort(argv[1:])
+        except BedError as exc:
+            sys.stderr.write(f"mytools: {exc}\n")
+            return 1
+        except UsageError as exc:
+            sys.stderr.write(f"mytools: {exc}\n")
+            return 2
+        except BrokenPipeError:
+            # Downstream closed the pipe (`| head`). Not our error.
+            sys.stderr.close()
+            return 0
 
     sys.stderr.write(f"mytools: unknown subcommand: {argv[0]}\n")
     sys.stderr.write(USAGE)
