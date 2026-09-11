@@ -1,0 +1,33 @@
+# Linter config for mytools. Ruff covers pyflakes, pycodestyle, isort and more in
+# one binary with no runtime dependency on the project.
+#
+#   ruff check .          lint
+#   ruff format --check . formatting
+
+line-length = 88
+target-version = "py310"
+
+# The entry point is an extensionless executable, so extension-based discovery
+# misses it. Without this line `ruff check .` silently lints nothing but tests/.
+extend-include = ["mytools"]
+
+# ruff format rewrites Python blocks inside Markdown. tests/README.md and the
+# other docs are upstream prose -- leave them alone.
+extend-exclude = ["*.md"]
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "RUF",
+]
+
+[lint.per-file-ignores]
+# Test bodies are the documentation of the edge cases; long explanatory asserts
+# and the import-by-path preamble are deliberate.
+"tests/*" = ["E402"]
