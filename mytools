@@ -19,6 +19,8 @@ usage: mytools <subcommand> [options]
   merge -i <file|-> [-d N]     join features whose gap is <= N (default 0)
   intersect -a <file|-> -b <file> [-u|-v|-wa]
                                report where -a features meet -b features
+  subtract  -a <file|-> -b <file>
+                               remove -b regions from -a features
   --version                    print the version and exit
 
 `-` means stdin.
@@ -402,7 +404,92 @@ def cmd_intersect(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"sort": cmd_sort, "merge": cmd_merge, "intersect": cmd_intersect}
+def remaining(
+    start: int, end: int, holes: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """[start, end) with every hole removed, left to right.
+
+    One feature can come back as two when a hole splits it, or as nothing when
+    the holes cover it. Zero-length fragments are never produced: a piece only
+    survives if it has at least one base.
+    """
+    pieces = [(start, end)]
+    for hole_start, hole_end in holes:
+        kept = []
+        for piece_start, piece_end in pieces:
+            if hole_end <= piece_start or hole_start >= piece_end:
+                kept.append((piece_start, piece_end))
+                continue
+            if piece_start < hole_start:
+                kept.append((piece_start, hole_start))
+            if hole_end < piece_end:
+                kept.append((hole_end, piece_end))
+        pieces = kept
+    return pieces
+
+
+def cmd_subtract(argv: list[str]) -> int:
+    """subtract -a <file|-> -b <file>
+
+    -a streams and keeps its input order. The holes are -b's WIDENED intervals,
+    which is why a01 (chr1 0 100) comes back as chr1 50 99 rather than
+    chr1 50 100: the zero-length b02 at 100 widens to [99, 101) and eats the
+    last base. Oracle behaviour -- see tests/README.md.
+    """
+    a_path = b_path = None
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "-a":
+            a_path = take_value(args, "subtract: -a")
+        elif arg == "-b":
+            b_path = take_value(args, "subtract: -b")
+        else:
+            raise UsageError(f"subtract: unrecognized argument: {arg}")
+    if a_path is None or b_path is None:
+        raise UsageError("subtract: -a and -b are both required")
+    if b_path == "-":
+        raise UsageError("subtract: -b must be a real file, not stdin")
+
+    index = Index.load(b_path)
+
+    stream = open_input(a_path)
+    try:
+        for record in read_bed(stream, a_path):
+            query_start, query_end = widen_if_empty(record.start, record.end)
+            holes = index.hits(record.chrom, query_start, query_end)
+            if not holes:
+                # Untouched features come through verbatim, columns and all.
+                sys.stdout.write(record.line + "\n")
+                continue
+
+            pieces = remaining(query_start, query_end, holes)
+
+            if record.start == record.end:
+                # A zero-length feature is subtracted as its widened span but
+                # printed as itself: it survives whole, or not at all. bedtools
+                # keeps chr1 9 9 against a hole at [9, 10) -- which leaves the
+                # base at 8 -- and drops it against a hole at [8, 10).
+                if pieces:
+                    sys.stdout.write(record.line + "\n")
+                continue
+
+            trailing = record.line.split("\t")[3:]
+            for start, end in pieces:
+                columns = [record.chrom, str(start), str(end), *trailing]
+                sys.stdout.write("\t".join(columns) + "\n")
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+    return 0
+
+
+COMMANDS = {
+    "sort": cmd_sort,
+    "merge": cmd_merge,
+    "intersect": cmd_intersect,
+    "subtract": cmd_subtract,
+}
 
 
 def main(argv: list[str]) -> int:
