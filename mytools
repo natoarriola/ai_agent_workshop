@@ -14,8 +14,9 @@ VERSION = "0.1.0"
 USAGE = """\
 usage: mytools <subcommand> [options]
 
-  sort -i <file|->    sort by chrom, then start, then end
-  --version           print the version and exit
+  sort  -i <file|->            sort by chrom, then start, then end
+  merge -i <file|-> [-d N]     join features whose gap is <= N (default 0)
+  --version                    print the version and exit
 
 `-` means stdin.
 """
@@ -88,6 +89,12 @@ def read_bed(stream: TextIO, source: str) -> Iterator[Record]:
         yield Record(fields[0], start, end, line)
 
 
+def take_value(args: list[str], flag: str) -> str:
+    if not args:
+        raise UsageError(f"{flag} requires a value")
+    return args.pop(0)
+
+
 def cmd_sort(argv: list[str]) -> int:
     """sort -i <file|->
 
@@ -100,9 +107,7 @@ def cmd_sort(argv: list[str]) -> int:
     while args:
         arg = args.pop(0)
         if arg == "-i":
-            if not args:
-                raise UsageError("sort: -i requires a file")
-            path = args.pop(0)
+            path = take_value(args, "sort: -i")
         else:
             raise UsageError(f"sort: unrecognized argument: {arg}")
     if path is None:
@@ -162,6 +167,111 @@ def within_merge_distance(prev_end: int, start: int, d: int = 0) -> bool:
     return start - prev_end <= d
 
 
+def merge_clusters(
+    records: Iterator[Record], distance: int, source: str
+) -> Iterator[tuple[str, int, int]]:
+    """Cluster sorted records, yielding (chrom, start, end) in BED3.
+
+    Zero-length features are widened to [x-1, x+1) and the widened coordinates
+    reach the output -- chr1 0 0 beside chr1 0 10 really does print chr1 -1 10.
+    The one exception is a cluster of a single feature, which prints its own
+    original coordinates, so a lone chr1 500 500 is unchanged while two of them
+    print chr1 499 501. Oracle behaviour, matched against bedtools on 25 cases.
+
+    Sortedness is checked the way bedtools checks it, which is loosely: start
+    order within a chromosome, and no returning to a chromosome already left.
+    Descending chromosomes are not an error -- chr2 before chr1 exits 0.
+    """
+    seen: set[str] = set()
+    chrom: str | None = None
+    start = end = 0
+    count = 0
+    first: Record | None = None
+    prev_start = 0
+
+    def cluster() -> tuple[str, int, int]:
+        assert chrom is not None and first is not None
+        # A lone feature keeps its own coordinates; any widening it got was
+        # only ever used to decide that nothing joined it.
+        if count == 1:
+            return (chrom, first.start, first.end)
+        return (chrom, start, end)
+
+    for record in records:
+        wide_start, wide_end = widen_if_empty(record.start, record.end)
+
+        if record.chrom != chrom:
+            if first is not None:
+                yield cluster()
+            if record.chrom in seen:
+                raise BedError(
+                    f"{source}: unsorted input: {record.chrom} appears again at "
+                    f"{record.start}; merge does not sort for you"
+                )
+            seen.add(record.chrom)
+            chrom = record.chrom
+            start, end, count, first = wide_start, wide_end, 1, record
+            prev_start = record.start
+            continue
+
+        if record.start < prev_start:
+            raise BedError(
+                f"{source}: unsorted input: {record.chrom}:{record.start} follows "
+                f"{prev_start}; merge does not sort for you"
+            )
+        prev_start = record.start
+
+        if wide_start - end <= distance:
+            end = max(end, wide_end)
+            count += 1
+        else:
+            yield cluster()
+            start, end, count, first = wide_start, wide_end, 1, record
+
+    if first is not None:
+        yield cluster()
+
+
+def cmd_merge(argv: list[str]) -> int:
+    """merge -i <file|-> [-d N]
+
+    Features join when the gap between them is <= d. The gap between bookended
+    features is 0, so they merge at the default d of 0 even though they do not
+    overlap. A negative d demands that much overlap instead.
+    """
+    path = None
+    distance = 0
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "-i":
+            path = take_value(args, "merge: -i")
+        elif arg == "-d":
+            raw = take_value(args, "merge: -d")
+            try:
+                distance = int(raw)
+            except ValueError:
+                raise UsageError(f"merge: -d needs an integer, got {raw!r}") from None
+        else:
+            raise UsageError(f"merge: unrecognized argument: {arg}")
+    if path is None:
+        raise UsageError("merge: -i is required")
+
+    stream = open_input(path)
+    try:
+        # Streaming: one cluster at a time, never the whole file.
+        clusters = merge_clusters(read_bed(stream, path), distance, path)
+        for chrom, start, end in clusters:
+            sys.stdout.write(f"{chrom}\t{start}\t{end}\n")
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
+    return 0
+
+
+COMMANDS = {"sort": cmd_sort, "merge": cmd_merge}
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         # Usage goes to stderr: stdout is data and gets piped.
@@ -176,9 +286,9 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(USAGE)
         return 0
 
-    if argv[0] == "sort":
+    if argv[0] in COMMANDS:
         try:
-            return cmd_sort(argv[1:])
+            return COMMANDS[argv[0]](argv[1:])
         except BedError as exc:
             sys.stderr.write(f"mytools: {exc}\n")
             return 1
