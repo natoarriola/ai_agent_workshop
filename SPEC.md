@@ -36,7 +36,10 @@ BED3 through BED6, tab-separated:
 
     chrom  start  end  [name  score  strand]
 
-- Column count may vary between lines; treat missing trailing columns as absent.
+- Column count must be consistent within a file. bedtools refuses ragged input
+  (`Differing number of BED fields encountered at line: 2.  Exiting...`, exit 1,
+  nothing on stdout) rather than padding the short lines, and it is the oracle.
+  Two different files may still have different widths.
 - Lines beginning with `#`, `track`, or `browser` are skipped silently.
 - Blank lines are skipped.
 - `start` and `end` are non-negative integers. `start > end` is an error (§7).
