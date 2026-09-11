@@ -1,7 +1,5 @@
-# Deliberately minimal. There is no test step yet -- growing this file is one of the
-# workshop exercises. By the end of the day this should install mytools and run three
-# things on every push and PR: the golden tests against bedtools, your unit tests, and
-# a linter. See tests/README.md and issues/03-golden-tests-and-ci.md.
+# Three guardrails on every push and PR: a linter, unit tests, and the golden
+# tests that diff us against real bedtools. See issues/03-golden-tests-and-ci.md.
 name: CI
 
 on:
@@ -14,15 +12,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Lint first: it is the fastest of the three and needs nothing installed
+      # but ruff itself. Pinned so a new release cannot turn CI red on its own.
+      - name: Install ruff
+        run: pipx install ruff==0.16.7
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Lint shell (shellcheck)
+        run: shellcheck tests/run_golden.sh
+
+      # No bedtools, no fixtures, milliseconds. If these fail, the golden tests
+      # below will too, and these say which predicate broke.
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
       - name: Install bedtools (the oracle)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bedtools
           bedtools --version
 
-      - name: Run golden tests
-        run: |
-          # TODO: replace this with ./tests/run_golden.sh once it exists.
-          # See tests/README.md for the pattern and a worked example.
-          echo "no tests yet"
-          exit 0
+      - name: Golden tests (vs bedtools)
+        run: ./tests/run_golden.sh
